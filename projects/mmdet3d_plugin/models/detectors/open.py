@@ -75,7 +75,7 @@ class OPEN(MVXTwoStageDetector):
                 img = self.grid_mask(img)
 
             if hasattr(self, 'prev_foreground_rois'):
-                img_feats = self.img_backbone(img, prev_rois=self.prev_foreground_rois)
+                img_feats = self.img_backbone(img, prev_rois=getattr(self, 'prev_foreground_rois', None))
             else:
                 img_feats = self.img_backbone(img)
 
@@ -309,17 +309,22 @@ class OPEN(MVXTwoStageDetector):
             score_thr = 0.3  # threshold for high confidence
             mask = scores > score_thr
 
+            # padding constraint max bounds
+            pad_h, pad_w = img_metas[0]['pad_shape'][0][:2]
+
             rois = []
             for i in range(bbox_preds.size(0)):  # Iterate through B*N views
                 bboxes = bbox_preds[i][mask[i]]
                 if bboxes.size(0) > 0:
-                    # Pad by 32 pixels for motion blur / movement
-                    bboxes[:, 0] = (bboxes[:, 0] - 32).clamp(min=0)
-                    bboxes[:, 1] = (bboxes[:, 1] - 32).clamp(min=0)
-                    bboxes[:, 2] = bboxes[:, 2] + 32
-                    bboxes[:, 3] = bboxes[:, 3] + 32
+                    # Pad by 64 pixels for motion blur / movement radially
+                    # to afford rich context for layer3's 3x3 convs
+                    bboxes[:, 0] = (bboxes[:, 0] - 64).clamp(min=0)
+                    bboxes[:, 1] = (bboxes[:, 1] - 64).clamp(min=0)
+                    bboxes[:, 2] = (bboxes[:, 2] + 64).clamp(max=pad_w)
+                    bboxes[:, 3] = (bboxes[:, 3] + 64).clamp(max=pad_h)
                     
                     # Ensure format is [batch_idx, x1, y1, x2, y2]
+                    # Where batch_indices map to the continuous flat multi-view indexing 0 ~ (B*N-1)
                     batch_indices = bboxes.new_full((bboxes.size(0), 1), i)
                     roi = torch.cat([batch_indices, bboxes], dim=-1)
                     rois.append(roi)

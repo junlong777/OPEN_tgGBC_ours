@@ -51,18 +51,16 @@ class DynamicResNet(ResNet):
             x2_f = min(W_f, int(torch.ceil(x2 / stride_ratio)))
             y2_f = min(H_f, int(torch.ceil(y2 / stride_ratio)))
             
-            w_f = x2_f - x1_f
-            h_f = y2_f - y1_f
-            
-            # 无效 RoI 越界或太小，跳过
-            if w_f <= 0 or h_f <= 0:
-                continue
+            w_f = max(1, x2_f - x1_f)
+            h_f = max(1, y2_f - y1_f)
+            x2_f = x1_f + w_f
+            y2_f = y1_f + h_f
                 
             # 3. 动态插值：将固定的 Patch size 缩放回现实特征图中的真实占地大小
             # patch shape: [1, C, H_p, W_p]
             patch = patches[i:i+1] 
             # patch_resized shape: [1, C, h_f, w_f]
-            patch_resized = F.interpolate(patch, size=(h_f, w_f), mode='bilinear', align_corners=False)
+            patch_resized = F.interpolate(patch.to(torch.float32), size=(h_f, w_f), mode='bilinear', align_corners=False).to(dtype)
             
             # 4. 回填处理：多视角中可能存在重叠的 bbox (也可能是单个目标有多个 anchor bbox)
             # 使用 torch.maximum 自动保留置信度/响应最强的高频特征
@@ -82,7 +80,7 @@ class DynamicResNet(ResNet):
             tuple: (x3, x4) 等按照 out_indices 返回的特征元组
         """
         # --- 边界情况：第一帧退化为全计算（或者未检测到目标的保守策略） ---
-        if prev_rois is None or prev_rois.size(0) == 0:
+        if self.training or prev_rois is None or prev_rois.size(0) == 0:
             return super().forward(x)
 
         # ---------------- 浅层正常提取：Stem -> layer1 -> layer2 ----------------
