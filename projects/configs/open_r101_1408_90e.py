@@ -43,7 +43,7 @@ model = dict(
         init_cfg=dict(
             type='Pretrained', checkpoint="ckpts/cascade_mask_rcnn_r101_fpn_1x_nuim_20201024_134804-45215b1e.pth",
             prefix='backbone.'),
-        type='ResNet',
+        type='DynamicResNet',
         depth=101,
         num_stages=4,
         out_indices=(2, 3),
