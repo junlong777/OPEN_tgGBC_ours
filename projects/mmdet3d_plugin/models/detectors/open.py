@@ -300,32 +300,36 @@ class OPEN(MVXTwoStageDetector):
         topk_indexes = outs_roi['topk_indexes']
 
         # --- Temporal Routing: Extract and pad 2D RoIs for the next frame ---
+        # TODO: 从 `outs_roi` 中提取高置信度的 2D BBox。
+        # 假设提取出的 bbox_preds 形状为 (N, K, 4) 或 (N*K, 4)，N 为相机视角数 (如 6)
         if 'enc_bbox_preds' in outs_roi and 'enc_cls_scores' in outs_roi:
             bbox_preds = outs_roi['enc_bbox_preds']  # [B*N, num_anchors, 4]
             cls_scores = outs_roi['enc_cls_scores']  # [B*N, num_anchors, num_classes]
 
-            # Get confidence scores (using sigmoid if logits)
+            # 筛选高置信度的锚框
             scores = cls_scores.sigmoid().max(dim=-1)[0]
-            score_thr = 0.3  # threshold for high confidence
+            score_thr = 0.3  # TODO: 根据实际模型响应情况可微调此阈值
             mask = scores > score_thr
 
-            # padding constraint max bounds
+            # pad_shape 包含了图像在预处理时的真实占位 [H, W, C]
             pad_h, pad_w = img_metas[0]['pad_shape'][0][:2]
 
             rois = []
-            for i in range(bbox_preds.size(0)):  # Iterate through B*N views
-                bboxes = bbox_preds[i][mask[i]]
+            for camera_idx in range(bbox_preds.size(0)):  # 遍历多视角 images (索引为 0 ~ N-1)
+                bboxes = bbox_preds[camera_idx][mask[camera_idx]]
                 if bboxes.size(0) > 0:
-                    # Pad by 64 pixels for motion blur / movement radially
-                    # to afford rich context for layer3's 3x3 convs
+                    # 激进 Padding：四周扩展 64 像素
+                    # 1. 补偿因时序带来的自车运动和目标平移。
+                    # 2. 为 layer3 的 3x3 卷积提供丰富的外围感受野 (Receptive Field)，防止边界特征崩塌。
                     bboxes[:, 0] = (bboxes[:, 0] - 64).clamp(min=0)
                     bboxes[:, 1] = (bboxes[:, 1] - 64).clamp(min=0)
                     bboxes[:, 2] = (bboxes[:, 2] + 64).clamp(max=pad_w)
                     bboxes[:, 3] = (bboxes[:, 3] + 64).clamp(max=pad_h)
                     
-                    # Ensure format is [batch_idx, x1, y1, x2, y2]
-                    # Where batch_indices map to the continuous flat multi-view indexing 0 ~ (B*N-1)
-                    batch_indices = bboxes.new_full((bboxes.size(0), 1), i)
+                    # 严谨映射：构建 [camera_idx, x1, y1, x2, y2]
+                    # 由于后续 `extract_img_feat` 中会将 `(1, N, C, H, W)` squeeze 并坍缩为 `(N, C, H, W)`，
+                    # 这里的 batch_idx 必须严格等于当前的相机索引 `camera_idx`。
+                    batch_indices = bboxes.new_full((bboxes.size(0), 1), camera_idx)
                     roi = torch.cat([batch_indices, bboxes], dim=-1)
                     rois.append(roi)
             
