@@ -6,4 +6,5 @@
 # ------------------------------------------------------------------------
 from .vovnet import VoVNet
 from .vovnetcp import VoVNetCP
+from .dynamic_resnet import DynamicResNet
 

@@ -51,6 +51,7 @@ class OPEN(MVXTwoStageDetector):
         self.grid_mask = GridMask(True, True, rotate=1, offset=False, ratio=0.5, mode=1, prob=0.7)
         self.use_grid_mask = use_grid_mask
         self.prev_scene_token = None
+        self.prev_foreground_rois = None
         self.num_frame_head_grads = num_frame_head_grads
         self.num_frame_backbone_grads = num_frame_backbone_grads
         self.num_frame_losses = num_frame_losses
@@ -73,7 +74,11 @@ class OPEN(MVXTwoStageDetector):
             if self.use_grid_mask:
                 img = self.grid_mask(img)
 
-            img_feats = self.img_backbone(img)
+            if hasattr(self, 'prev_foreground_rois'):
+                img_feats = self.img_backbone(img, prev_rois=self.prev_foreground_rois)
+            else:
+                img_feats = self.img_backbone(img)
+
             if isinstance(img_feats, dict):
                 img_feats = list(img_feats.values())
         else:
@@ -287,11 +292,45 @@ class OPEN(MVXTwoStageDetector):
             data['prev_exists'] = data['img'].new_zeros(1)
             self.img_roi_head.reset_memory()
             self.pts_bbox_head.reset_memory()
+            self.prev_foreground_rois = None
         else:
             data['prev_exists'] = data['img'].new_ones(1)
 
         outs_roi = self.forward_roi_head(img_metas, **data)
         topk_indexes = outs_roi['topk_indexes']
+
+        # --- Temporal Routing: Extract and pad 2D RoIs for the next frame ---
+        if 'enc_bbox_preds' in outs_roi and 'enc_cls_scores' in outs_roi:
+            bbox_preds = outs_roi['enc_bbox_preds']  # [B*N, num_anchors, 4]
+            cls_scores = outs_roi['enc_cls_scores']  # [B*N, num_anchors, num_classes]
+
+            # Get confidence scores (using sigmoid if logits)
+            scores = cls_scores.sigmoid().max(dim=-1)[0]
+            score_thr = 0.3  # threshold for high confidence
+            mask = scores > score_thr
+
+            rois = []
+            for i in range(bbox_preds.size(0)):  # Iterate through B*N views
+                bboxes = bbox_preds[i][mask[i]]
+                if bboxes.size(0) > 0:
+                    # Pad by 32 pixels for motion blur / movement
+                    bboxes[:, 0] = (bboxes[:, 0] - 32).clamp(min=0)
+                    bboxes[:, 1] = (bboxes[:, 1] - 32).clamp(min=0)
+                    bboxes[:, 2] = bboxes[:, 2] + 32
+                    bboxes[:, 3] = bboxes[:, 3] + 32
+                    
+                    # Ensure format is [batch_idx, x1, y1, x2, y2]
+                    batch_indices = bboxes.new_full((bboxes.size(0), 1), i)
+                    roi = torch.cat([batch_indices, bboxes], dim=-1)
+                    rois.append(roi)
+            
+            if len(rois) > 0:
+                self.prev_foreground_rois = torch.cat(rois, dim=0)
+            else:
+                self.prev_foreground_rois = None
+        else:
+            self.prev_foreground_rois = None
+        # --------------------------------------------------------------------
 
         outs = self.pts_bbox_head(outs_roi, img_metas, topk_indexes, **data)
         bbox_list = self.pts_bbox_head.get_bboxes(
