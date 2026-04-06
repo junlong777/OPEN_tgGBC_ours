@@ -74,7 +74,8 @@ class OPEN(MVXTwoStageDetector):
             if self.use_grid_mask:
                 img = self.grid_mask(img)
 
-            if hasattr(self, 'prev_foreground_rois'):
+            # 只给支持时序路由的 Backbone (DynamicResNet) 传递 prev_rois
+            if hasattr(self, 'prev_foreground_rois') and type(self.img_backbone).__name__ == 'DynamicResNet':
                 img_feats = self.img_backbone(img, prev_rois=getattr(self, 'prev_foreground_rois', None))
             else:
                 img_feats = self.img_backbone(img)
