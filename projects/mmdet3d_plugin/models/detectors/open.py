@@ -318,6 +318,9 @@ class OPEN(MVXTwoStageDetector):
             rois = []
             for camera_idx in range(bbox_preds.size(0)):  # 遍历多视角 images (索引为 0 ~ N-1)
                 bboxes = bbox_preds[camera_idx][mask[camera_idx]]
+                # 强行截断，每个视角只保留前 5 个框
+                bboxes = bboxes[:5]
+                
                 if bboxes.size(0) > 0:
                     # 激进 Padding：四周扩展 64 像素
                     # 1. 补偿因时序带来的自车运动和目标平移。

@@ -16,7 +16,7 @@ class DynamicResNet(ResNet):
     in deep layers (layer3 -> layer4).
     """
 
-    def __init__(self, roi_size=(32, 32), **kwargs):
+    def __init__(self, roi_size=(7, 7), **kwargs):
         super(DynamicResNet, self).__init__(**kwargs)
         self.roi_size = roi_size  # RoIAlign 提取时的固定分辨率尺寸
 
