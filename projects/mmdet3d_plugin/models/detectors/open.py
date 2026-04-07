@@ -323,7 +323,8 @@ class OPEN(MVXTwoStageDetector):
             
             # --- 精准边缘唤醒 (Precise Edge Wakeup) ---
             threshold = 0.05
-            wakeup_thresh = 0.15
+            # 因为处于边缘的往往是被截断的物体局部，其得分通常略低于图像中心的核心目标，降低阈值能提高跨相机交接的召回率。
+            wakeup_thresh = 0.10
             min_k = 4
             
             # 基础激活列表
@@ -333,15 +334,15 @@ class OPEN(MVXTwoStageDetector):
             left_adj = {0: 2, 1: 0, 5: 1, 3: 5, 4: 3, 2: 4}
             right_adj = {0: 1, 1: 5, 5: 3, 3: 4, 4: 2, 2: 0}
             
-            # 计算特征图的宽度 W
+            # --- 修复：从真实的特征张量中获取绝对精准的 W，杜绝任何缩放带来的舍入误差 ---
+            # data['img_feats'] 的 shape 通常为 (B, N, C, H, W)
+            W = data['img_feats'].size(-1)
             pts_per_cam = scores_per_cam[0].size(0)
-            downsample_ratio = 16  # 请使用注释标明这是一个超参
-            W = img_metas[0]['pad_shape'][0][1] // downsample_ratio
             
-            # 生成横坐标掩码 (免 Reshape 技术)
+            # 生成横坐标掩码 (精确对齐)
             x_coords = torch.arange(pts_per_cam, device=scores.device) % W
-            left_mask = x_coords < (W * 0.2)   # 左侧 20% 区域
-            right_mask = x_coords >= (W * 0.8) # 右侧 20% 区域
+            left_mask = x_coords < (W * 0.2)   # 左侧 20% 物理区域
+            right_mask = x_coords >= (W * 0.8) # 右侧 20% 物理区域
             
             for c in range(6):
                 cam_scores = scores_per_cam[c]
