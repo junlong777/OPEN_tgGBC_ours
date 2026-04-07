@@ -52,7 +52,6 @@ class OPEN(MVXTwoStageDetector):
         self.use_grid_mask = use_grid_mask
         self.prev_scene_token = None
         self.prev_active_cams = None
-        self.cam_staleness = None
         self.num_frame_head_grads = num_frame_head_grads
         self.num_frame_backbone_grads = num_frame_backbone_grads
         self.num_frame_losses = num_frame_losses
@@ -93,6 +92,14 @@ class OPEN(MVXTwoStageDetector):
             img_feats_reshaped = img_feats[self.position_level].view(B, len_queue, int(BN/B / len_queue), C, H, W)
         else:
             img_feats_reshaped = img_feats[self.position_level].view(B, int(BN/B/len_queue), C, H, W)
+            
+            # --- 恢复幽灵清洗 (Ghost Masking) ---
+            if getattr(self, 'prev_active_cams', None) is not None:
+                mask = torch.zeros(int(BN/B/len_queue), dtype=img_feats_reshaped.dtype, device=img_feats_reshaped.device)
+                mask[self.prev_active_cams] = 1.0
+                # mask shape: [6, 1, 1, 1] 广播到 [B, 6, C, H, W]
+                mask = mask.view(1, -1, 1, 1, 1)
+                img_feats_reshaped = img_feats_reshaped * mask
 
         return img_feats_reshaped
 
@@ -295,10 +302,6 @@ class OPEN(MVXTwoStageDetector):
             self.img_roi_head.reset_memory()
             self.pts_bbox_head.reset_memory()
             self.prev_active_cams = None
-            self.cam_staleness = torch.zeros(6, dtype=torch.long, device=data['img'].device)
-            # 清空 Backbone 中的基础特征缓存
-            if hasattr(self.img_backbone, 'feat_cache'):
-                self.img_backbone.feat_cache = None
         else:
             data['prev_exists'] = data['img'].new_ones(1)
 
@@ -318,43 +321,32 @@ class OPEN(MVXTwoStageDetector):
             # 获取每个相机内部所有特征点的最大激活分数作为该相机的存活依据
             max_scores = torch.stack([cam_s.max() for cam_s in scores_per_cam])  # Shape: [6]
             
-            # --- 动态阈值 + Min-K 保底 (Adaptive Threshold with Min-K Guarantee) ---
+            # --- 相邻相机唤醒 (Context Wakeup) ---
             threshold = 0.05
-            min_k = 4  # 至少保留4个相机以防止视野过度退退
+            wakeup_thresh = 0.15
+            min_k = 4
             
-            # 提取出大于阈值的激活性相机
-            above_thresh_cams = torch.nonzero(max_scores > threshold).squeeze(-1)
+            # 基础激活列表
+            active_cams_list = torch.nonzero(max_scores > threshold).squeeze(-1).tolist()
             
-            # 混合策略判断：如果过阈值的相机满足最小值要求，则采用动态阈值过滤
-            if above_thresh_cams.numel() >= min_k:
-                active_cams = above_thresh_cams
-            else:
-                # 否则如果过阈值的相机太少，触发保底机制，强制取 Top-K
+            # 相邻图定义 (NuScenes 相邻相机)
+            adj_map = {0: [1, 2], 1: [0, 3, 5], 2: [0, 3, 4], 3: [4, 5], 4: [2, 3], 5: [1, 3]}
+            
+            # 如果某个相机有极强核心目标 (>3倍阈值)，将其空间相邻的相机也提早激活，提供上下文
+            for c in range(6):
+                if max_scores[c] > wakeup_thresh:
+                    active_cams_list.extend(adj_map[c])
+                    
+            # 转换为 Tensor 排重去重
+            active_cams_tensor = torch.unique(torch.tensor(active_cams_list, dtype=torch.long, device=scores.device))
+            
+            # Min-K 保底：激活的太少则补充
+            if active_cams_tensor.numel() < min_k:
                 topk_indices = torch.topk(max_scores, k=min_k).indices
-                # 必须排序以保持送入模型时的物理相机顺序不乱
-                active_cams = topk_indices.sort().values
-            
-            # --- 时序强制唤醒 (Staleness-Aware Temporal Feature Reuse) ---
-            if self.cam_staleness.device != max_scores.device:
-                self.cam_staleness = self.cam_staleness.to(max_scores.device)
+                active_cams_tensor = torch.unique(torch.cat([active_cams_tensor, topk_indices]))
                 
-            is_active = torch.zeros(6, dtype=torch.bool, device=self.cam_staleness.device)
-            is_active[active_cams] = True
-            
-            # 活跃的清零，不活跃的增加陈旧度
-            self.cam_staleness[is_active] = 0
-            self.cam_staleness[~is_active] += 1
-            
-            max_staleness = 3
-            # 找出陈旧度达到最大值的相机，强制唤醒
-            forced_cams = torch.nonzero(self.cam_staleness >= max_staleness).squeeze(-1)
-            
-            if forced_cams.numel() > 0:
-                # 合并强制唤醒的相机，并重新排序以保证顺序
-                active_cams = torch.unique(torch.cat([active_cams, forced_cams])).sort().values
-                self.cam_staleness[forced_cams] = 0
-                
-            self.prev_active_cams = active_cams
+            # 排序物理相机顺序
+            self.prev_active_cams = active_cams_tensor.sort().values
         else:
             self.prev_active_cams = None
         # --------------------------------------------------------------------

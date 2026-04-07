@@ -17,7 +17,6 @@ class DynamicResNet(ResNet):
 
     def __init__(self, **kwargs):
         super(DynamicResNet, self).__init__(**kwargs)
-        self.feat_cache = None  # 初始化时序特征缓存状态
 
     def forward(self, x, active_cams=None):
         """
@@ -28,11 +27,8 @@ class DynamicResNet(ResNet):
             tuple: (x3, x4) 等按照 out_indices 返回的特征元组
         """
         # --- 退回全图计算（训练、首次调用、或者全部相机高优） ---
-        if self.training or active_cams is None or len(active_cams) == x.size(0) or self.feat_cache is None:
-            outs = super().forward(x)
-            # 全图计算完毕后，脱离计算图缓存最新的深层特征 (0 FLOPs 基础)
-            self.feat_cache = tuple(out.detach().clone() for out in outs)
-            return outs
+        if self.training or active_cams is None or len(active_cams) == x.size(0):
+            return super().forward(x)
 
         # ---------------- 浅层正常提取：Stem -> layer1 -> layer2 ----------------
         if self.deep_stem:
@@ -53,31 +49,23 @@ class DynamicResNet(ResNet):
         # x_feat shape: [B_N, C_layer2, H_2, W_2]  (stride=8)
         x2_active = x_feat[active_cams]
         
-        # ---------------- 深层局部加速计算与复用：layer3 -> layer4 ----------------
+        # ---------------- 深层局部加速计算：layer3 -> layer4 ----------------
         # --- 增量计算激活的特征 ---
         x3_active = self.layer3(x2_active)
         x4_active = self.layer4(x3_active)
         
         outs = []
-        new_cache = []
-        cache_idx = 0
         
         if 2 in self.out_indices:
-            # 调出上一帧的全部时序特征作为底图，彻底防止自车漂移丢失结构
-            x3_full = self.feat_cache[cache_idx].clone()
+            # 生成全0张量作为底图
+            x3_full = torch.zeros((x.size(0), x3_active.size(1), x3_active.size(2), x3_active.size(3)), dtype=x3_active.dtype, device=x3_active.device)
             # 局部刷新真实的新算力目标
             x3_full[active_cams] = x3_active
             outs.append(x3_full)
-            new_cache.append(x3_full.detach().clone())
-            cache_idx += 1
             
         if 3 in self.out_indices:
-            x4_full = self.feat_cache[cache_idx].clone()
+            x4_full = torch.zeros((x.size(0), x4_active.size(1), x4_active.size(2), x4_active.size(3)), dtype=x4_active.dtype, device=x4_active.device)
             x4_full[active_cams] = x4_active
             outs.append(x4_full)
-            new_cache.append(x4_full.detach().clone())
-            cache_idx += 1
 
-        # 同步更新下一帧的缓存状态
-        self.feat_cache = tuple(new_cache)
         return tuple(outs)
