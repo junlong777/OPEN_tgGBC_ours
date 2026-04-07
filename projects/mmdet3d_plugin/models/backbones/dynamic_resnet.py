@@ -15,6 +15,10 @@ class DynamicResNet(ResNet):
     cameras in deep layers (layer3 -> layer4).
     """
 
+    def __init__(self, **kwargs):
+        super(DynamicResNet, self).__init__(**kwargs)
+        self.feat_cache = None  # 初始化时序特征缓存状态
+
     def forward(self, x, active_cams=None):
         """
         Args:
@@ -23,12 +27,14 @@ class DynamicResNet(ResNet):
         Returns:
             tuple: (x3, x4) 等按照 out_indices 返回的特征元组
         """
-        # --- 边界情况：第一帧退化为全计算（或者未丢弃任何相机） ---
-        if self.training or active_cams is None or len(active_cams) == x.size(0):
-            return super().forward(x)
+        # --- 退回全图计算（训练、首次调用、或者全部相机高优） ---
+        if self.training or active_cams is None or len(active_cams) == x.size(0) or self.feat_cache is None:
+            outs = super().forward(x)
+            # 全图计算完毕后，脱离计算图缓存最新的深层特征 (0 FLOPs 基础)
+            self.feat_cache = tuple(out.detach().clone() for out in outs)
+            return outs
 
         # ---------------- 浅层正常提取：Stem -> layer1 -> layer2 ----------------
-        outs = []
         if self.deep_stem:
             x_feat = self.stem(x)
         else:
@@ -42,37 +48,36 @@ class DynamicResNet(ResNet):
             layer_name = self.res_layers[i]
             res_layer = getattr(self, layer_name)
             x_feat = res_layer(x_feat)
-            if i in self.out_indices:
-                outs.append(x_feat)
 
         # ---------------- 中间阶段：根据 active_cams 挑选存活的相机视角下潜 ----------------
         # x_feat shape: [B_N, C_layer2, H_2, W_2]  (stride=8)
         x2_active = x_feat[active_cams]
         
-        # ---------------- 深层局部加速计算与回填：layer3 -> layer4 ----------------
-        
-        # --- Stage 3 (layer3) ---
+        # ---------------- 深层局部加速计算与复用：layer3 -> layer4 ----------------
+        # --- 增量计算激活的特征 ---
         x3_active = self.layer3(x2_active)
-        # x3_active shape: [num_active, C_layer3, H_3, W_3]
+        x4_active = self.layer4(x3_active)
+        
+        outs = []
+        new_cache = []
+        cache_idx = 0
         
         if 2 in self.out_indices:
-            # 还原补零
-            B_N = x.size(0)
-            x3_full = torch.zeros(B_N, x3_active.size(1), x3_active.size(2), x3_active.size(3), 
-                                  dtype=x3_active.dtype, device=x3_active.device)
+            # 调出上一帧的全部时序特征作为底图，彻底防止自车漂移丢失结构
+            x3_full = self.feat_cache[cache_idx].clone()
+            # 局部刷新真实的新算力目标
             x3_full[active_cams] = x3_active
             outs.append(x3_full)
+            new_cache.append(x3_full.detach().clone())
+            cache_idx += 1
             
-        # --- Stage 4 (layer4) ---
-        x4_active = self.layer4(x3_active)
-        # x4_active shape: [num_active, C_layer4, H_4, W_4]
-        
         if 3 in self.out_indices:
-            # 还原补零
-            B_N = x.size(0)
-            x4_full = torch.zeros(B_N, x4_active.size(1), x4_active.size(2), x4_active.size(3), 
-                                  dtype=x4_active.dtype, device=x4_active.device)
+            x4_full = self.feat_cache[cache_idx].clone()
             x4_full[active_cams] = x4_active
             outs.append(x4_full)
+            new_cache.append(x4_full.detach().clone())
+            cache_idx += 1
 
+        # 同步更新下一帧的缓存状态
+        self.feat_cache = tuple(new_cache)
         return tuple(outs)

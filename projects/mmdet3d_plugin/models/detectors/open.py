@@ -52,6 +52,7 @@ class OPEN(MVXTwoStageDetector):
         self.use_grid_mask = use_grid_mask
         self.prev_scene_token = None
         self.prev_active_cams = None
+        self.cam_staleness = None
         self.num_frame_head_grads = num_frame_head_grads
         self.num_frame_backbone_grads = num_frame_backbone_grads
         self.num_frame_losses = num_frame_losses
@@ -92,18 +93,6 @@ class OPEN(MVXTwoStageDetector):
             img_feats_reshaped = img_feats[self.position_level].view(B, len_queue, int(BN/B / len_queue), C, H, W)
         else:
             img_feats_reshaped = img_feats[self.position_level].view(B, int(BN/B/len_queue), C, H, W)
-
-        # --- 深层幽灵特征清洗 (Ghost Feature Masking) ---
-        if not self.training and getattr(self, 'prev_active_cams', None) is not None:
-            num_cams = img_feats_reshaped.size(1)  # 通常为 6
-            # 如果全部保留，则无需清洗
-            if self.prev_active_cams.numel() < num_cams:
-                mask = torch.zeros(num_cams, dtype=img_feats_reshaped.dtype, device=img_feats_reshaped.device)
-                mask[self.prev_active_cams] = 1.0
-                # 广播掩码形状以匹配 [B, N, C, H, W]
-                mask = mask.view(1, num_cams, 1, 1, 1)
-                # 物理抹除 FPN 产生的无用偏置响应
-                img_feats_reshaped = img_feats_reshaped * mask
 
         return img_feats_reshaped
 
@@ -306,6 +295,10 @@ class OPEN(MVXTwoStageDetector):
             self.img_roi_head.reset_memory()
             self.pts_bbox_head.reset_memory()
             self.prev_active_cams = None
+            self.cam_staleness = torch.zeros(6, dtype=torch.long, device=data['img'].device)
+            # 清空 Backbone 中的基础特征缓存
+            if hasattr(self.img_backbone, 'feat_cache'):
+                self.img_backbone.feat_cache = None
         else:
             data['prev_exists'] = data['img'].new_ones(1)
 
@@ -341,6 +334,26 @@ class OPEN(MVXTwoStageDetector):
                 # 必须排序以保持送入模型时的物理相机顺序不乱
                 active_cams = topk_indices.sort().values
             
+            # --- 时序强制唤醒 (Staleness-Aware Temporal Feature Reuse) ---
+            if self.cam_staleness.device != max_scores.device:
+                self.cam_staleness = self.cam_staleness.to(max_scores.device)
+                
+            is_active = torch.zeros(6, dtype=torch.bool, device=self.cam_staleness.device)
+            is_active[active_cams] = True
+            
+            # 活跃的清零，不活跃的增加陈旧度
+            self.cam_staleness[is_active] = 0
+            self.cam_staleness[~is_active] += 1
+            
+            max_staleness = 3
+            # 找出陈旧度达到最大值的相机，强制唤醒
+            forced_cams = torch.nonzero(self.cam_staleness >= max_staleness).squeeze(-1)
+            
+            if forced_cams.numel() > 0:
+                # 合并强制唤醒的相机，并重新排序以保证顺序
+                active_cams = torch.unique(torch.cat([active_cams, forced_cams])).sort().values
+                self.cam_staleness[forced_cams] = 0
+                
             self.prev_active_cams = active_cams
         else:
             self.prev_active_cams = None
