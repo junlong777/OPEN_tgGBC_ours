@@ -93,6 +93,18 @@ class OPEN(MVXTwoStageDetector):
         else:
             img_feats_reshaped = img_feats[self.position_level].view(B, int(BN/B/len_queue), C, H, W)
 
+        # --- 深层幽灵特征清洗 (Ghost Feature Masking) ---
+        if not self.training and getattr(self, 'prev_active_cams', None) is not None:
+            num_cams = img_feats_reshaped.size(1)  # 通常为 6
+            # 如果全部保留，则无需清洗
+            if self.prev_active_cams.numel() < num_cams:
+                mask = torch.zeros(num_cams, dtype=img_feats_reshaped.dtype, device=img_feats_reshaped.device)
+                mask[self.prev_active_cams] = 1.0
+                # 广播掩码形状以匹配 [B, N, C, H, W]
+                mask = mask.view(1, num_cams, 1, 1, 1)
+                # 物理抹除 FPN 产生的无用偏置响应
+                img_feats_reshaped = img_feats_reshaped * mask
+
         return img_feats_reshaped
 
     @auto_fp16(apply_to=('img'), out_fp32=True)
@@ -313,13 +325,21 @@ class OPEN(MVXTwoStageDetector):
             # 获取每个相机内部所有特征点的最大激活分数作为该相机的存活依据
             max_scores = torch.stack([cam_s.max() for cam_s in scores_per_cam])  # Shape: [6]
             
-            # 使用阈值过滤出激活相机超参 (TODO: 可根据掉点/加速收益平衡，微调该数值 0.05)
+            # --- 动态阈值 + Min-K 保底 (Adaptive Threshold with Min-K Guarantee) ---
             threshold = 0.05
-            active_cams = torch.nonzero(max_scores > threshold).squeeze(-1)
+            min_k = 4  # 至少保留4个相机以防止视野过度退退
             
-            # 防御性回退：如果没有任何相机达到阈值（或者异常情况），为防止训练图中全部丢失目标，则强制全选 6 个相机
-            if active_cams.numel() == 0:
-                active_cams = torch.arange(6, device=scores.device)
+            # 提取出大于阈值的激活性相机
+            above_thresh_cams = torch.nonzero(max_scores > threshold).squeeze(-1)
+            
+            # 混合策略判断：如果过阈值的相机满足最小值要求，则采用动态阈值过滤
+            if above_thresh_cams.numel() >= min_k:
+                active_cams = above_thresh_cams
+            else:
+                # 否则如果过阈值的相机太少，触发保底机制，强制取 Top-K
+                topk_indices = torch.topk(max_scores, k=min_k).indices
+                # 必须排序以保持送入模型时的物理相机顺序不乱
+                active_cams = topk_indices.sort().values
             
             self.prev_active_cams = active_cams
         else:
