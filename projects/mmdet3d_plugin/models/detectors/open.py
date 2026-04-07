@@ -51,7 +51,7 @@ class OPEN(MVXTwoStageDetector):
         self.grid_mask = GridMask(True, True, rotate=1, offset=False, ratio=0.5, mode=1, prob=0.7)
         self.use_grid_mask = use_grid_mask
         self.prev_scene_token = None
-        self.prev_foreground_rois = None
+        self.prev_active_cams = None
         self.num_frame_head_grads = num_frame_head_grads
         self.num_frame_backbone_grads = num_frame_backbone_grads
         self.num_frame_losses = num_frame_losses
@@ -74,9 +74,9 @@ class OPEN(MVXTwoStageDetector):
             if self.use_grid_mask:
                 img = self.grid_mask(img)
 
-            # 只给支持时序路由的 Backbone (DynamicResNet) 传递 prev_rois
-            if hasattr(self, 'prev_foreground_rois') and type(self.img_backbone).__name__ == 'DynamicResNet':
-                img_feats = self.img_backbone(img, prev_rois=getattr(self, 'prev_foreground_rois', None))
+            # 只给支持时序路由的 Backbone (DynamicResNet) 传递 active_cams
+            if hasattr(self, 'prev_active_cams') and type(self.img_backbone).__name__ == 'DynamicResNet':
+                img_feats = self.img_backbone(img, active_cams=getattr(self, 'prev_active_cams', None))
             else:
                 img_feats = self.img_backbone(img)
 
@@ -293,59 +293,39 @@ class OPEN(MVXTwoStageDetector):
             data['prev_exists'] = data['img'].new_zeros(1)
             self.img_roi_head.reset_memory()
             self.pts_bbox_head.reset_memory()
-            self.prev_foreground_rois = None
+            self.prev_active_cams = None
         else:
             data['prev_exists'] = data['img'].new_ones(1)
 
         outs_roi = self.forward_roi_head(img_metas, **data)
         topk_indexes = outs_roi['topk_indexes']
 
-        # --- Temporal Routing: Extract and pad 2D RoIs for the next frame ---
-        # TODO: 从 `outs_roi` 中提取高置信度的 2D BBox。
-        # 假设提取出的 bbox_preds 形状为 (N, K, 4) 或 (N*K, 4)，N 为相机视角数 (如 6)
-        if 'enc_bbox_preds' in outs_roi and 'enc_cls_scores' in outs_roi:
-            bbox_preds = outs_roi['enc_bbox_preds']  # [B*N, num_anchors, 4]
-            cls_scores = outs_roi['enc_cls_scores']  # [B*N, num_anchors, num_classes]
+        outs = self.pts_bbox_head(outs_roi, img_metas, topk_indexes, **data)
 
-            # 筛选高置信度的锚框
-            scores = cls_scores.sigmoid().max(dim=-1)[0]
-            score_thr = 0.3  # TODO: 根据实际模型响应情况可微调此阈值
-            mask = scores > score_thr
+        # --- Temporal Routing: tgGBC-Guided Camera Routing (TGC-Routing) ---
+        # 通过获取 Transformer 内部最新结算的注意力 & 语义重要性得分，决定下一帧应该前向哪些相机
+        scores = getattr(torch, 'tgGBC_latest_scores', None)
+        if scores is not None and scores.dim() == 2:  # scores shape 理论上为: [1, Nk]
+            # 假设 B=1, 场景中有 N=6 个相机。Nk 是特征点总数。
+            # 由于特征在网络中被展平且相机是按顺序排列的，我们将总张量沿相机数 (6) 均分成对应块
+            scores_per_cam = scores[0].chunk(6, dim=0)
 
-            # pad_shape 包含了图像在预处理时的真实占位 [H, W, C]
-            pad_h, pad_w = img_metas[0]['pad_shape'][0][:2]
-
-            rois = []
-            for camera_idx in range(bbox_preds.size(0)):  # 遍历多视角 images (索引为 0 ~ N-1)
-                bboxes = bbox_preds[camera_idx][mask[camera_idx]]
-                # 强行截断，每个视角只保留前 5 个框
-                bboxes = bboxes[:5]
-                
-                if bboxes.size(0) > 0:
-                    # 激进 Padding：四周扩展 64 像素
-                    # 1. 补偿因时序带来的自车运动和目标平移。
-                    # 2. 为 layer3 的 3x3 卷积提供丰富的外围感受野 (Receptive Field)，防止边界特征崩塌。
-                    bboxes[:, 0] = (bboxes[:, 0] - 64).clamp(min=0)
-                    bboxes[:, 1] = (bboxes[:, 1] - 64).clamp(min=0)
-                    bboxes[:, 2] = (bboxes[:, 2] + 64).clamp(max=pad_w)
-                    bboxes[:, 3] = (bboxes[:, 3] + 64).clamp(max=pad_h)
-                    
-                    # 严谨映射：构建 [camera_idx, x1, y1, x2, y2]
-                    # 由于后续 `extract_img_feat` 中会将 `(1, N, C, H, W)` squeeze 并坍缩为 `(N, C, H, W)`，
-                    # 这里的 batch_idx 必须严格等于当前的相机索引 `camera_idx`。
-                    batch_indices = bboxes.new_full((bboxes.size(0), 1), camera_idx)
-                    roi = torch.cat([batch_indices, bboxes], dim=-1)
-                    rois.append(roi)
+            # 获取每个相机内部所有特征点的最大激活分数作为该相机的存活依据
+            max_scores = torch.stack([cam_s.max() for cam_s in scores_per_cam])  # Shape: [6]
             
-            if len(rois) > 0:
-                self.prev_foreground_rois = torch.cat(rois, dim=0)
-            else:
-                self.prev_foreground_rois = None
+            # 使用阈值过滤出激活相机超参 (TODO: 可根据掉点/加速收益平衡，微调该数值 0.05)
+            threshold = 0.05
+            active_cams = torch.nonzero(max_scores > threshold).squeeze(-1)
+            
+            # 防御性回退：如果没有任何相机达到阈值（或者异常情况），为防止训练图中全部丢失目标，则强制全选 6 个相机
+            if active_cams.numel() == 0:
+                active_cams = torch.arange(6, device=scores.device)
+            
+            self.prev_active_cams = active_cams
         else:
-            self.prev_foreground_rois = None
+            self.prev_active_cams = None
         # --------------------------------------------------------------------
 
-        outs = self.pts_bbox_head(outs_roi, img_metas, topk_indexes, **data)
         bbox_list = self.pts_bbox_head.get_bboxes(
             outs, img_metas)
         bbox_results = [

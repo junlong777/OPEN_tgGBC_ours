@@ -47,6 +47,8 @@ def trim_gbc(
 
         # scores: [B, Nk]
         scores = torch.sum(scores, dim=1)
+        # [新增] 将最新一层的分数缓存到 torch 全局变量中，供 Backbone 时序路由使用
+        torch.tgGBC_latest_scores = scores.clone().detach()
         # indices: [B, Nk]
         indices = scores.sort().indices
 
