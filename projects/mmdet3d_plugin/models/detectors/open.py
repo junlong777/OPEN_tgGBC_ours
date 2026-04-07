@@ -321,7 +321,7 @@ class OPEN(MVXTwoStageDetector):
             # 获取每个相机内部所有特征点的最大激活分数作为该相机的存活依据
             max_scores = torch.stack([cam_s.max() for cam_s in scores_per_cam])  # Shape: [6]
             
-            # --- 相邻相机唤醒 (Context Wakeup) ---
+            # --- 精准边缘唤醒 (Precise Edge Wakeup) ---
             threshold = 0.05
             wakeup_thresh = 0.15
             min_k = 4
@@ -329,13 +329,32 @@ class OPEN(MVXTwoStageDetector):
             # 基础激活列表
             active_cams_list = torch.nonzero(max_scores > threshold).squeeze(-1).tolist()
             
-            # 相邻图定义 (NuScenes 相邻相机)
-            adj_map = {0: [1, 2], 1: [0, 3, 5], 2: [0, 3, 4], 3: [4, 5], 4: [2, 3], 5: [1, 3]}
+            # 定义物理左右相邻拓扑 (nuScenes 格式)
+            left_adj = {0: 2, 1: 0, 5: 1, 3: 5, 4: 3, 2: 4}
+            right_adj = {0: 1, 1: 5, 5: 3, 3: 4, 4: 2, 2: 0}
             
-            # 如果某个相机有极强核心目标 (>3倍阈值)，将其空间相邻的相机也提早激活，提供上下文
+            # 计算特征图的宽度 W
+            pts_per_cam = scores_per_cam[0].size(0)
+            downsample_ratio = 16  # 请使用注释标明这是一个超参
+            W = img_metas[0]['pad_shape'][0][1] // downsample_ratio
+            
+            # 生成横坐标掩码 (免 Reshape 技术)
+            x_coords = torch.arange(pts_per_cam, device=scores.device) % W
+            left_mask = x_coords < (W * 0.2)   # 左侧 20% 区域
+            right_mask = x_coords >= (W * 0.8) # 右侧 20% 区域
+            
             for c in range(6):
-                if max_scores[c] > wakeup_thresh:
-                    active_cams_list.extend(adj_map[c])
+                cam_scores = scores_per_cam[c]
+                
+                # 提取左右边缘的分数
+                left_scores = cam_scores[left_mask]
+                right_scores = cam_scores[right_mask]
+                
+                # 独立判断精准唤醒
+                if left_scores.numel() > 0 and left_scores.max() > wakeup_thresh:
+                    active_cams_list.append(left_adj[c])
+                if right_scores.numel() > 0 and right_scores.max() > wakeup_thresh:
+                    active_cams_list.append(right_adj[c])
                     
             # 转换为 Tensor 排重去重
             active_cams_tensor = torch.unique(torch.tensor(active_cams_list, dtype=torch.long, device=scores.device))
