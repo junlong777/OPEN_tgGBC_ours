@@ -325,13 +325,13 @@ class OPEN(MVXTwoStageDetector):
                 return tensor.topk(actual_k).values.mean()
 
             # 获取每个相机内部所有特征点的最大激活分数作为该相机的存活依据
-            max_scores = torch.stack([get_soft_score(cam_s, 50) for cam_s in scores_per_cam])  # Shape: [6]
+            max_scores = torch.stack([get_soft_score(cam_s, 15) for cam_s in scores_per_cam])  # Shape: [6]
             
             # --- 精准边缘唤醒 (Precise Edge Wakeup) ---
-            threshold = 0.005      # 基础存活阈值 (原为 0.05)
+            threshold = 0.0015      # 基础存活阈值 (原为 0.05)
             # 因为处于边缘的往往是被截断的物体局部，其得分通常略低于图像中心的核心目标，降低阈值能提高跨相机交接的召回率。
-            wakeup_thresh = 0.015  # 边缘唤醒阈值 (原为 0.10 或 0.15)
-            min_k = 4
+            wakeup_thresh = 0.005  # 边缘唤醒阈值 (原为 0.10 或 0.15)
+            min_k = 2
             
             # 基础激活列表
             active_cams_list = torch.nonzero(max_scores > threshold).squeeze(-1).tolist()
@@ -358,8 +358,8 @@ class OPEN(MVXTwoStageDetector):
                 right_scores = cam_scores[right_mask]
                 
                 # 计算软得分
-                left_soft_score = get_soft_score(left_scores, 20)
-                right_soft_score = get_soft_score(right_scores, 20)
+                left_soft_score = get_soft_score(left_scores, 5)
+                right_soft_score = get_soft_score(right_scores, 5)
                 
                 # 独立判断精准唤醒
                 if left_soft_score > wakeup_thresh:
