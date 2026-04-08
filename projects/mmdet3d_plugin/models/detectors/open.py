@@ -318,13 +318,19 @@ class OPEN(MVXTwoStageDetector):
             # 由于特征在网络中被展平且相机是按顺序排列的，我们将总张量沿相机数 (6) 均分成对应块
             scores_per_cam = scores[0].chunk(6, dim=0)
 
+            def get_soft_score(tensor, k):
+                if tensor.numel() == 0:
+                    return torch.tensor(0.0, device=tensor.device)
+                actual_k = min(k, tensor.numel())
+                return tensor.topk(actual_k).values.mean()
+
             # 获取每个相机内部所有特征点的最大激活分数作为该相机的存活依据
-            max_scores = torch.stack([cam_s.max() for cam_s in scores_per_cam])  # Shape: [6]
+            max_scores = torch.stack([get_soft_score(cam_s, 50) for cam_s in scores_per_cam])  # Shape: [6]
             
             # --- 精准边缘唤醒 (Precise Edge Wakeup) ---
-            threshold = 0.05
+            threshold = 0.005      # 基础存活阈值 (原为 0.05)
             # 因为处于边缘的往往是被截断的物体局部，其得分通常略低于图像中心的核心目标，降低阈值能提高跨相机交接的召回率。
-            wakeup_thresh = 0.10
+            wakeup_thresh = 0.015  # 边缘唤醒阈值 (原为 0.10 或 0.15)
             min_k = 4
             
             # 基础激活列表
@@ -351,10 +357,14 @@ class OPEN(MVXTwoStageDetector):
                 left_scores = cam_scores[left_mask]
                 right_scores = cam_scores[right_mask]
                 
+                # 计算软得分
+                left_soft_score = get_soft_score(left_scores, 20)
+                right_soft_score = get_soft_score(right_scores, 20)
+                
                 # 独立判断精准唤醒
-                if left_scores.numel() > 0 and left_scores.max() > wakeup_thresh:
+                if left_soft_score > wakeup_thresh:
                     active_cams_list.append(left_adj[c])
-                if right_scores.numel() > 0 and right_scores.max() > wakeup_thresh:
+                if right_soft_score > wakeup_thresh:
                     active_cams_list.append(right_adj[c])
                     
             # 转换为 Tensor 排重去重
