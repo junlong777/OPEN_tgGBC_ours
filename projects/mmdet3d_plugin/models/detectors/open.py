@@ -312,26 +312,38 @@ class OPEN(MVXTwoStageDetector):
         outs = self.pts_bbox_head(outs_roi, img_metas, topk_indexes, **data)
 
         # --- Temporal Routing: tgGBC-Guided Camera Routing (TGC-Routing) ---
+        # --- Temporal Routing: tgGBC-Guided Camera Routing (TGC-Routing) ---
         scores = getattr(torch, 'tgGBC_latest_scores', None)
-        if scores is not None and scores.dim() == 2:
-            # scores shape: [num_heads, Nk]. 必须对所有注意力头取均值，消除单头偏置
+        if scores is not None and scores.dim() == 2:  # scores shape: [num_heads, Nk]
+            # 必须对所有注意力头取均值，消除单头偏置
             scores_mean = scores.mean(dim=0)  # Shape: [Nk]
             scores_per_cam = scores_mean.chunk(6, dim=0)
             
-            # 定义软聚合函数 K=15
+            # 定义软聚合函数 K=15 (解决大目标注意力稀释)
             def get_soft_score(tensor, k=15):
                 if tensor.numel() == 0: return torch.tensor(0.0, device=tensor.device)
                 actual_k = min(k, tensor.numel())
                 return tensor.topk(actual_k).values.mean()
 
-            # --- 数据驱动的自适应阈值 (Adaptive Thresholding) ---
-            global_mean = scores_mean.mean()
-            threshold = global_mean * 2.0       # 存活阈值：显著高于全局平均
-            wakeup_thresh = global_mean * 1.2   # 唤醒阈值：略高于全局平均
-            min_k = 2                           # 空旷场景极致下探，至少保留2个相机
-
             # 计算各个相机的软聚合得分
             max_scores = torch.stack([get_soft_score(cam_s) for cam_s in scores_per_cam])
+
+            # --- 修复：双重数据驱动自适应阈值 (Dual-Adaptive Thresholding) ---
+            global_mean = scores_mean.mean()
+            best_cam_score = max_scores.max()
+            
+            # 1. 绝对噪声底线：Top-K 的纯噪声均值通常是全局均值的 5 倍左右
+            floor_thresh = global_mean * 5.0
+            # 2. 相对显著性拦截：丢弃那些连场景最强目标 5% 分数都达不到的冗余视角
+            rel_thresh = best_cam_score * 0.05
+            
+            # 最终存活阈值与唤醒阈值
+            threshold = torch.max(floor_thresh, rel_thresh)
+            wakeup_thresh = torch.max(global_mean * 8.0, best_cam_score * 0.10)
+            
+            min_k = 2  # 极度空旷场景至少保留 2 个核心视野
+
+            # 过滤出存活的相机
             active_cams_list = torch.nonzero(max_scores > threshold).squeeze(-1).tolist()
 
             # --- 精准边缘唤醒 (Precise Edge Wakeup) ---
@@ -364,6 +376,7 @@ class OPEN(MVXTwoStageDetector):
             self.prev_active_cams = active_cams_tensor.sort().values
         else:
             self.prev_active_cams = None
+        # --------------------------------------------------------------------
         # --------------------------------------------------------------------
 
         bbox_list = self.pts_bbox_head.get_bboxes(
