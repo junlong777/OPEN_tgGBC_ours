@@ -311,72 +311,68 @@ class OPEN(MVXTwoStageDetector):
 
         outs = self.pts_bbox_head(outs_roi, img_metas, topk_indexes, **data)
 
-        # --- Temporal Routing: tgGBC-Guided Camera Routing (TGC-Routing) ---
-        # --- Temporal Routing: tgGBC-Guided Camera Routing (TGC-Routing) ---
+        # --- Temporal Routing: TGC-Routing (Nucleus / Top-p 架构) ---
         scores = getattr(torch, 'tgGBC_latest_scores', None)
-        if scores is not None and scores.dim() == 2:  # scores shape: [num_heads, Nk]
-            # 必须对所有注意力头取均值，消除单头偏置
+        if scores is not None and scores.dim() == 2:  
             scores_mean = scores.mean(dim=0)  # Shape: [Nk]
             scores_per_cam = scores_mean.chunk(6, dim=0)
             
-            # 定义软聚合函数 K=15 (解决大目标注意力稀释)
-            def get_soft_score(tensor, k=15):
+            # --- 升级 1：能量聚合函数 ---
+            # 使用 sum() 代替 mean()，真实反映该区域累积的 3D 注意力质量，防小目标被兑水
+            def get_energy(tensor, k=50):
                 if tensor.numel() == 0: return torch.tensor(0.0, device=tensor.device)
                 actual_k = min(k, tensor.numel())
-                return tensor.topk(actual_k).values.mean()
+                return tensor.topk(actual_k).values.sum()
 
-            # 计算各个相机的软聚合得分
-            max_scores = torch.stack([get_soft_score(cam_s) for cam_s in scores_per_cam])
+            # 计算每个相机的总能量，并转化为全局概率分布
+            cam_energies = torch.stack([get_energy(cam_s) for cam_s in scores_per_cam])
+            total_energy = cam_energies.sum() + 1e-6
+            cam_probs = cam_energies / total_energy  # Shape: [6], 概率和约等于 1.0
 
-            # --- 修复：双重数据驱动自适应阈值 (Dual-Adaptive Thresholding) ---
-            global_mean = scores_mean.mean()
-            best_cam_score = max_scores.max()
+            # --- 升级 2：Nucleus (Top-p) 动态路由 ---
+            p_target = 0.92  # 核心超参：保证涵盖当前帧 92% 的注意力能量
+            min_k = 2        # 保底视野
+
+            sorted_probs, sorted_indices = torch.sort(cam_probs, descending=True)
+            cumsum_probs = torch.cumsum(sorted_probs, dim=0)
             
-            # 1. 绝对噪声底线：Top-K 的纯噪声均值通常是全局均值的 5 倍左右
-            floor_thresh = global_mean * 5.0
-            # 2. 相对显著性拦截：丢弃那些连场景最强目标 5% 分数都达不到的冗余视角
-            rel_thresh = best_cam_score * 0.05
+            # 找到刚刚满足或超过 p_target 的相机数量
+            keep_num = (cumsum_probs < p_target).sum().item() + 1
+            keep_num = max(keep_num, min_k)
             
-            # 最终存活阈值与唤醒阈值
-            threshold = torch.max(floor_thresh, rel_thresh)
-            wakeup_thresh = torch.max(global_mean * 8.0, best_cam_score * 0.10)
-            
-            min_k = 2  # 极度空旷场景至少保留 2 个核心视野
+            active_cams_list = sorted_indices[:keep_num].tolist()
 
-            # 过滤出存活的相机
-            active_cams_list = torch.nonzero(max_scores > threshold).squeeze(-1).tolist()
-
-            # --- 精准边缘唤醒 (Precise Edge Wakeup) ---
+            # --- 升级 3：基于概率的精准边缘唤醒 ---
             left_adj = {0: 2, 1: 0, 5: 1, 3: 5, 4: 3, 2: 4}
             right_adj = {0: 1, 1: 5, 5: 3, 3: 4, 4: 2, 2: 0}
             
-            # 从真实特征张量获取精确宽度 W，防舍入误差
             W = data['img_feats'].size(-1)
             pts_per_cam = scores_per_cam[0].size(0)
             x_coords = torch.arange(pts_per_cam, device=scores.device) % W
             left_mask = x_coords < (W * 0.2)
             right_mask = x_coords >= (W * 0.8)
 
+            # 如果某个相机的边缘区域，独立占据了全局 4% 以上的注意力，强制唤醒相邻相机
+            edge_prob_thresh = 0.04  
+
             for c in range(6):
                 cam_scores = scores_per_cam[c]
-                left_soft = get_soft_score(cam_scores[left_mask], k=5)
-                right_soft = get_soft_score(cam_scores[right_mask], k=5)
+                left_prob = get_energy(cam_scores[left_mask], k=10) / total_energy
+                right_prob = get_energy(cam_scores[right_mask], k=10) / total_energy
                 
-                if left_soft > wakeup_thresh:
+                if left_prob > edge_prob_thresh:
                     active_cams_list.append(left_adj[c])
-                if right_soft > wakeup_thresh:
+                if right_prob > edge_prob_thresh:
                     active_cams_list.append(right_adj[c])
 
-            # 去重与 Min-K 保底
+            # 去重、排序并保存
             active_cams_tensor = torch.unique(torch.tensor(active_cams_list, dtype=torch.long, device=scores.device))
-            if active_cams_tensor.numel() < min_k:
-                topk_indices = torch.topk(max_scores, k=min_k).indices
-                active_cams_tensor = torch.unique(torch.cat([active_cams_tensor, topk_indices]))
-                
             self.prev_active_cams = active_cams_tensor.sort().values
+            
+            # 临时测速与分布监控仪 (请保留此 print)
+            # print(f"🔥 Cams: {self.prev_active_cams.numel()} | Probs: {[round(p.item(), 3) for p in cam_probs]}")
         else:
             self.prev_active_cams = None
-        # --------------------------------------------------------------------
         # --------------------------------------------------------------------
 
         bbox_list = self.pts_bbox_head.get_bboxes(
