@@ -75,9 +75,10 @@ class OPEN(MVXTwoStageDetector):
                 img = self.grid_mask(img)
 
             # 只给支持时序路由的 Backbone (DynamicResNet) 传递 active_cams
-            if hasattr(self, 'prev_active_cams') and type(self.img_backbone).__name__ == 'DynamicResNet':
-                img_feats = self.img_backbone(img, active_cams=getattr(self, 'prev_active_cams', None))
-            else:
+            prev_cams = getattr(self, 'prev_active_cams', None)
+            try:
+                img_feats = self.img_backbone(img, active_cams=prev_cams)
+            except TypeError:
                 img_feats = self.img_backbone(img)
 
             if isinstance(img_feats, dict):
@@ -311,71 +312,55 @@ class OPEN(MVXTwoStageDetector):
         outs = self.pts_bbox_head(outs_roi, img_metas, topk_indexes, **data)
 
         # --- Temporal Routing: tgGBC-Guided Camera Routing (TGC-Routing) ---
-        # 通过获取 Transformer 内部最新结算的注意力 & 语义重要性得分，决定下一帧应该前向哪些相机
         scores = getattr(torch, 'tgGBC_latest_scores', None)
-        if scores is not None and scores.dim() == 2:  # scores shape 理论上为: [1, Nk]
-            # 假设 B=1, 场景中有 N=6 个相机。Nk 是特征点总数。
-            # 由于特征在网络中被展平且相机是按顺序排列的，我们将总张量沿相机数 (6) 均分成对应块
-            scores_per_cam = scores[0].chunk(6, dim=0)
-
-            def get_soft_score(tensor, k):
-                if tensor.numel() == 0:
-                    return torch.tensor(0.0, device=tensor.device)
+        if scores is not None and scores.dim() == 2:
+            # scores shape: [num_heads, Nk]. 必须对所有注意力头取均值，消除单头偏置
+            scores_mean = scores.mean(dim=0)  # Shape: [Nk]
+            scores_per_cam = scores_mean.chunk(6, dim=0)
+            
+            # 定义软聚合函数 K=15
+            def get_soft_score(tensor, k=15):
+                if tensor.numel() == 0: return torch.tensor(0.0, device=tensor.device)
                 actual_k = min(k, tensor.numel())
                 return tensor.topk(actual_k).values.mean()
 
-            # 获取每个相机内部所有特征点的最大激活分数作为该相机的存活依据
-            max_scores = torch.stack([get_soft_score(cam_s, 15) for cam_s in scores_per_cam])  # Shape: [6]
-            
-            # --- 精准边缘唤醒 (Precise Edge Wakeup) ---
-            threshold = 0.0015      # 基础存活阈值 (原为 0.05)
-            # 因为处于边缘的往往是被截断的物体局部，其得分通常略低于图像中心的核心目标，降低阈值能提高跨相机交接的召回率。
-            wakeup_thresh = 0.005  # 边缘唤醒阈值 (原为 0.10 或 0.15)
-            min_k = 2
-            
-            # 基础激活列表
+            # --- 数据驱动的自适应阈值 (Adaptive Thresholding) ---
+            global_mean = scores_mean.mean()
+            threshold = global_mean * 2.0       # 存活阈值：显著高于全局平均
+            wakeup_thresh = global_mean * 1.2   # 唤醒阈值：略高于全局平均
+            min_k = 2                           # 空旷场景极致下探，至少保留2个相机
+
+            # 计算各个相机的软聚合得分
+            max_scores = torch.stack([get_soft_score(cam_s) for cam_s in scores_per_cam])
             active_cams_list = torch.nonzero(max_scores > threshold).squeeze(-1).tolist()
-            
-            # 定义物理左右相邻拓扑 (nuScenes 格式)
+
+            # --- 精准边缘唤醒 (Precise Edge Wakeup) ---
             left_adj = {0: 2, 1: 0, 5: 1, 3: 5, 4: 3, 2: 4}
             right_adj = {0: 1, 1: 5, 5: 3, 3: 4, 4: 2, 2: 0}
             
-            # --- 修复：从真实的特征张量中获取绝对精准的 W，杜绝任何缩放带来的舍入误差 ---
-            # data['img_feats'] 的 shape 通常为 (B, N, C, H, W)
+            # 从真实特征张量获取精确宽度 W，防舍入误差
             W = data['img_feats'].size(-1)
             pts_per_cam = scores_per_cam[0].size(0)
-            
-            # 生成横坐标掩码 (精确对齐)
             x_coords = torch.arange(pts_per_cam, device=scores.device) % W
-            left_mask = x_coords < (W * 0.2)   # 左侧 20% 物理区域
-            right_mask = x_coords >= (W * 0.8) # 右侧 20% 物理区域
-            
+            left_mask = x_coords < (W * 0.2)
+            right_mask = x_coords >= (W * 0.8)
+
             for c in range(6):
                 cam_scores = scores_per_cam[c]
+                left_soft = get_soft_score(cam_scores[left_mask], k=5)
+                right_soft = get_soft_score(cam_scores[right_mask], k=5)
                 
-                # 提取左右边缘的分数
-                left_scores = cam_scores[left_mask]
-                right_scores = cam_scores[right_mask]
-                
-                # 计算软得分
-                left_soft_score = get_soft_score(left_scores, 5)
-                right_soft_score = get_soft_score(right_scores, 5)
-                
-                # 独立判断精准唤醒
-                if left_soft_score > wakeup_thresh:
+                if left_soft > wakeup_thresh:
                     active_cams_list.append(left_adj[c])
-                if right_soft_score > wakeup_thresh:
+                if right_soft > wakeup_thresh:
                     active_cams_list.append(right_adj[c])
-                    
-            # 转换为 Tensor 排重去重
+
+            # 去重与 Min-K 保底
             active_cams_tensor = torch.unique(torch.tensor(active_cams_list, dtype=torch.long, device=scores.device))
-            
-            # Min-K 保底：激活的太少则补充
             if active_cams_tensor.numel() < min_k:
                 topk_indices = torch.topk(max_scores, k=min_k).indices
                 active_cams_tensor = torch.unique(torch.cat([active_cams_tensor, topk_indices]))
                 
-            # 排序物理相机顺序
             self.prev_active_cams = active_cams_tensor.sort().values
         else:
             self.prev_active_cams = None
