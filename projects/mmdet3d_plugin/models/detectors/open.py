@@ -306,6 +306,14 @@ class OPEN(MVXTwoStageDetector):
         else:
             data['prev_exists'] = data['img'].new_ones(1)
 
+        # 构建并挂载 Transformer Padding Mask
+        cam_padding_mask = torch.ones((1, 6), dtype=torch.bool, device=data['img'].device)
+        if self.prev_active_cams is not None:
+            cam_padding_mask[0, self.prev_active_cams] = False
+        else:
+            cam_padding_mask.fill_(False)
+        data['cam_padding_mask'] = cam_padding_mask
+
         outs_roi = self.forward_roi_head(img_metas, **data)
         topk_indexes = outs_roi['topk_indexes']
 
@@ -313,52 +321,55 @@ class OPEN(MVXTwoStageDetector):
 
         # --- Temporal Routing: TGC-Routing (Nucleus / Top-p 架构) ---
         scores = getattr(torch, 'tgGBC_latest_scores', None)
-        if scores is not None and scores.dim() == 2:  
-            scores_mean = scores.mean(dim=0)  # Shape: [Nk]
-            scores_per_cam = scores_mean.chunk(6, dim=0)
+        if scores is not None and scores.dim() == 2 and topk_indexes is not None:  
+            scores_mean = scores.mean(dim=0)  # Shape: [Nk], e.g., 10896
             
-            # --- 升级 1：能量聚合函数 ---
-            # 使用 sum() 代替 mean()，真实反映该区域累积的 3D 注意力质量，防小目标被兑水
-            def get_energy(tensor, k=50):
-                if tensor.numel() == 0: return torch.tensor(0.0, device=tensor.device)
-                actual_k = min(k, tensor.numel())
-                return tensor.topk(actual_k).values.sum()
+            # --- 修复 2：正确对齐 Top-K 索引获取真实物理坐标 ---
+            H, W = data['img_feats'].shape[-2:]
+            # topk_indexes shape is [B, Nk], take the first batch
+            valid_indexes = topk_indexes[0]  
+            cam_ids = valid_indexes // (H * W)
+            x_coords = valid_indexes % W
+            
+            def get_energy_from_indices(cam_idx, edge_mask=None, k=50):
+                mask = (cam_ids == cam_idx)
+                if edge_mask is not None:
+                    mask = mask & edge_mask
+                cam_scores = scores_mean[mask]
+                if cam_scores.numel() == 0: return torch.tensor(0.0, device=scores.device)
+                actual_k = min(k, cam_scores.numel())
+                return cam_scores.topk(actual_k).values.sum()
 
-            # 计算每个相机的总能量，并转化为全局概率分布
-            cam_energies = torch.stack([get_energy(cam_s) for cam_s in scores_per_cam])
+            # --- 升级 1：能量锐化与计算概率 ---
+            cam_energies = torch.stack([get_energy_from_indices(c) for c in range(6)])
+            cam_energies = cam_energies ** 2  # 能量平方放大
             total_energy = cam_energies.sum() + 1e-6
-            cam_probs = cam_energies / total_energy  # Shape: [6], 概率和约等于 1.0
+            cam_probs = cam_energies / total_energy  # Shape: [6]
 
-            # --- 升级 2：Nucleus (Top-p) 动态路由 ---
-            p_target = 0.92  # 核心超参：保证涵盖当前帧 92% 的注意力能量
-            min_k = 2        # 保底视野
+            # --- 核采样 (Nucleus / Top-p) ---
+            p_target = 0.82  # 下调至 0.82
+            min_k = 2        
 
             sorted_probs, sorted_indices = torch.sort(cam_probs, descending=True)
             cumsum_probs = torch.cumsum(sorted_probs, dim=0)
             
-            # 找到刚刚满足或超过 p_target 的相机数量
             keep_num = (cumsum_probs < p_target).sum().item() + 1
             keep_num = max(keep_num, min_k)
             
             active_cams_list = sorted_indices[:keep_num].tolist()
 
-            # --- 升级 3：基于概率的精准边缘唤醒 ---
+            # --- 升级 3：利用物理真实 X 坐标进行精准边缘唤醒 ---
             left_adj = {0: 2, 1: 0, 5: 1, 3: 5, 4: 3, 2: 4}
             right_adj = {0: 1, 1: 5, 5: 3, 3: 4, 4: 2, 2: 0}
             
-            W = data['img_feats'].size(-1)
-            pts_per_cam = scores_per_cam[0].size(0)
-            x_coords = torch.arange(pts_per_cam, device=scores.device) % W
+            edge_prob_thresh = 0.04  
+            
             left_mask = x_coords < (W * 0.2)
             right_mask = x_coords >= (W * 0.8)
 
-            # 如果某个相机的边缘区域，独立占据了全局 4% 以上的注意力，强制唤醒相邻相机
-            edge_prob_thresh = 0.04  
-
             for c in range(6):
-                cam_scores = scores_per_cam[c]
-                left_prob = get_energy(cam_scores[left_mask], k=10) / total_energy
-                right_prob = get_energy(cam_scores[right_mask], k=10) / total_energy
+                left_prob = get_energy_from_indices(c, left_mask, k=10) / total_energy
+                right_prob = get_energy_from_indices(c, right_mask, k=10) / total_energy
                 
                 if left_prob > edge_prob_thresh:
                     active_cams_list.append(left_adj[c])
@@ -369,8 +380,6 @@ class OPEN(MVXTwoStageDetector):
             active_cams_tensor = torch.unique(torch.tensor(active_cams_list, dtype=torch.long, device=scores.device))
             self.prev_active_cams = active_cams_tensor.sort().values
             
-            # 临时测速与分布监控仪 (请保留此 print)
-            # print(f"🔥 Cams: {self.prev_active_cams.numel()} | Probs: {[round(p.item(), 3) for p in cam_probs]}")
         else:
             self.prev_active_cams = None
         # --------------------------------------------------------------------

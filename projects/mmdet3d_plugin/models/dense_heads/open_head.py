@@ -157,6 +157,18 @@ class OpenHead(StreamPETRHead):
             self.temporal_alignment(query_pos, tgt, reference_points)
         )
 
+        # --- 提取并扩展 cam_padding_mask ---
+        cam_padding_mask = data.get('cam_padding_mask', None)
+        # 加入严格的形状判断和容错，防止 DataLoader 中意外卷入同名数据或空 Batch 异常
+        if cam_padding_mask is not None and cam_padding_mask.numel() in (B * N, N):
+            # 将掩码按物理空间展平对齐
+            key_padding_mask = cam_padding_mask.view(-1, N, 1, 1).expand(B, N, H, W)
+            key_padding_mask = key_padding_mask.reshape(B, num_tokens)
+            if topk_indexes is not None:
+                key_padding_mask = topk_gather(key_padding_mask, topk_indexes)
+        else:
+            key_padding_mask = None
+
         # --- 添加计时开始 ---
         torch.cuda.synchronize()
         start_dec = time.time()
@@ -170,6 +182,7 @@ class OpenHead(StreamPETRHead):
             attn_mask,
             temp_memory,
             temp_pos,
+            mask=key_padding_mask,
             reference_points=reference_points,
             cls_branches=self.cls_branches,
             reg_branches=self.reg_branches,
