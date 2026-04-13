@@ -269,47 +269,56 @@ class OPEN(MVXTwoStageDetector):
         topk_indexes = outs_roi['topk_indexes']
         outs = self.pts_bbox_head(outs_roi, img_metas, topk_indexes, **data)
 
-        # --- Temporal Routing: Zero-Sync Mean-Relative (保守过滤版) ---
+        # --- Temporal Routing: Zero-Sync Saliency-Relative (小目标保护版) ---
         scores = getattr(torch, 'tgGBC_latest_scores', None)
         if scores is not None and scores.dim() == 2:  
             scores_mean = scores.mean(dim=0)  
             
-            # 【物理拆分】完美将 [Nk] 还原为 6 个相机的空间特征
+            # [6, H*W]
             scores_per_cam = scores_mean.view(6, -1) 
-            scores_sq = scores_per_cam ** 2
-            cam_energies = scores_sq.sum(dim=1)
+
+            # --- 核心革新：Top-K 显著性评估 (打破面积霸权，拯救远距离小目标) ---
+            # 不再求全图总和，而是提取每个视角最强的 50 个响应点
+            k_core = min(50, scores_per_cam.size(1))
+            cam_saliency = scores_per_cam.topk(k_core, dim=1).values.sum(dim=1)
 
             W = data['img_feats'].size(-1)
             pts_per_cam = scores_per_cam.size(1)
             x_coords = torch.arange(pts_per_cam, device=scores.device) % W
+            
             left_mask = x_coords < (W * 0.2)
             right_mask = x_coords >= (W * 0.8)
+            zero_pad = torch.tensor(0.0, device=scores.device)
             
-            left_energies = (scores_sq * left_mask.unsqueeze(0)).sum(dim=1)
-            right_energies = (scores_sq * right_mask.unsqueeze(0)).sum(dim=1)
+            left_scores = torch.where(left_mask.unsqueeze(0), scores_per_cam, zero_pad)
+            right_scores = torch.where(right_mask.unsqueeze(0), scores_per_cam, zero_pad)
+            
+            # 边缘截断区域同样采用 Top-K 提取关键信号，避免被大量边缘空像素稀释
+            k_edge = min(15, scores_per_cam.size(1))
+            left_saliency = left_scores.topk(k_edge, dim=1).values.sum(dim=1)
+            right_saliency = right_scores.topk(k_edge, dim=1).values.sum(dim=1)
 
-            # --- 核心：Mean-Relative 保守过滤 ---
-            mean_energy = cam_energies.mean() + 1e-6
+            # --- 显著性相对阈值过滤 ---
+            mean_saliency = cam_saliency.mean() + 1e-6
             
-            # 极度保守：只要能量达到“平均值的 12%”就保留。只会剔除纯空视野
-            core_thresh = mean_energy * 0.12 
-            core_mask = cam_energies > core_thresh
+            # 由于大目标的优势被削弱，均值变得更加真实。0.35 能够精准卡掉纯背景噪声相机
+            core_thresh = mean_saliency * 0.35 
+            core_mask = cam_saliency > core_thresh
             core_cams = torch.nonzero(core_mask).squeeze(1)
             
-            # 保底留 3 个相机，严守 3D 环视的基础几何感知底线
+            # 严守 3D 几何张角的生命线
             if len(core_cams) < 3:
-                _, core_cams = torch.topk(cam_energies, 3)
+                _, core_cams = torch.topk(cam_saliency, 3)
 
-            # --- 精准边缘唤醒 ---
-            edge_thresh = 0.05
-            # 边缘能量除以相机自身能量，防误触
-            left_trigger = (left_energies / (cam_energies + 1e-6)) > edge_thresh
-            right_trigger = (right_energies / (cam_energies + 1e-6)) > edge_thresh
+            # --- 边缘唤醒 ---
+            edge_thresh = 0.15  # 边缘区最强的 15 个点达到均值的 15% 即可触发唤醒
+            left_trigger = left_saliency > (mean_saliency * edge_thresh)
+            right_trigger = right_saliency > (mean_saliency * edge_thresh)
 
             left_adj_tensor = torch.tensor([2, 0, 4, 5, 3, 1], device=scores.device)
             right_adj_tensor = torch.tensor([1, 5, 0, 4, 2, 3], device=scores.device)
 
-            # 仅唤醒活跃相机的邻居
+            # 仅唤醒活跃相机的物理邻居，阻断噪声相机的链式蔓延
             triggered_left = left_adj_tensor[core_cams][left_trigger[core_cams]]
             triggered_right = right_adj_tensor[core_cams][right_trigger[core_cams]]
 
