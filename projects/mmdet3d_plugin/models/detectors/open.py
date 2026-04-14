@@ -278,8 +278,8 @@ class OPEN(MVXTwoStageDetector):
             scores_per_cam = scores_mean.view(6, -1) 
 
             # --- 核心革新：Top-K 显著性评估 (打破面积霸权，拯救远距离小目标) ---
-            # 不再求全图总和，而是提取每个视角最强的 50 个响应点
-            k_core = min(50, scores_per_cam.size(1))
+            # 不再求全图总和，而是提取每个视角最强的 xx 个响应点
+            k_core = min(30, scores_per_cam.size(1))
             cam_saliency = scores_per_cam.topk(k_core, dim=1).values.sum(dim=1)
 
             W = data['img_feats'].size(-1)
@@ -294,15 +294,15 @@ class OPEN(MVXTwoStageDetector):
             right_scores = torch.where(right_mask.unsqueeze(0), scores_per_cam, zero_pad)
             
             # 边缘截断区域同样采用 Top-K 提取关键信号，避免被大量边缘空像素稀释
-            k_edge = min(15, scores_per_cam.size(1))
+            k_edge = min(10, scores_per_cam.size(1))
             left_saliency = left_scores.topk(k_edge, dim=1).values.sum(dim=1)
             right_saliency = right_scores.topk(k_edge, dim=1).values.sum(dim=1)
 
             # --- 显著性相对阈值过滤 ---
             mean_saliency = cam_saliency.mean() + 1e-6
             
-            # 由于大目标的优势被削弱，均值变得更加真实。0.35 能够精准卡掉纯背景噪声相机
-            core_thresh = mean_saliency * 0.35 
+            # 由于大目标的优势被削弱，均值变得更加真实。
+            core_thresh = mean_saliency * 0.35
             core_mask = cam_saliency > core_thresh
             core_cams = torch.nonzero(core_mask).squeeze(1)
             
@@ -311,7 +311,7 @@ class OPEN(MVXTwoStageDetector):
                 _, core_cams = torch.topk(cam_saliency, 3)
 
             # --- 边缘唤醒 ---
-            edge_thresh = 0.15  # 边缘区最强的 15 个点达到均值的 15% 即可触发唤醒
+            edge_thresh = 0.12  # 边缘区最强的 xx 个点达到均值的 xx% 即可触发唤醒
             left_trigger = left_saliency > (mean_saliency * edge_thresh)
             right_trigger = right_saliency > (mean_saliency * edge_thresh)
 
